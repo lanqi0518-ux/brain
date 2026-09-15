@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  contracts:
+    name: Foundry (build + test + fmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: nightly
+
+      - name: Install OpenZeppelin
+        run: forge install OpenZeppelin/openzeppelin-contracts --no-commit --shallow || true
+
+      - name: Format check
+        run: forge fmt --check
+
+      - name: Build
+        run: forge build --sizes
+
+      - name: Test
+        run: forge test -vvv
+
+      - name: Coverage summary
+        run: forge coverage --report summary || true
+
+  slither:
+    name: Slither static analysis
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: forge install OpenZeppelin/openzeppelin-contracts --no-commit --shallow || true
+      - uses: crytic/slither-action@v0.4.0
+        with:
+          fail-on: none
+          slither-args: --exclude-dependencies --exclude naming-convention,solc-version
