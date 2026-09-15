@@ -7,50 +7,121 @@ import {MultiplierAwareOracle} from "../contracts/lend/MultiplierAwareOracle.sol
 import {MultiplierBridge, IL2ToL3Messenger} from "../contracts/bridge/MultiplierBridge.sol";
 import {SessionKeyRouter} from "../contracts/session/SessionKeyRouter.sol";
 import {PortfolioMarginRouter} from "../contracts/margin/PortfolioMarginRouter.sol";
+import {StonkToken} from "../contracts/token/StonkToken.sol";
+import {StonkPoints} from "../contracts/points/StonkPoints.sol";
+import {UsdgPaymaster} from "../contracts/paymaster/UsdgPaymaster.sol";
+import {LighterAdapter} from "../contracts/perp/LighterAdapter.sol";
 import {ILighter} from "../contracts/interfaces/ILighter.sol";
 import {IMorphoBlue} from "../contracts/interfaces/IMorphoBlue.sol";
-import {IChainlinkDataStream} from "../contracts/interfaces/IChainlinkDataStream.sol";
 
-/// @notice One-shot deployment for the five STONK core contracts. Runs on
-///         any Arbitrum-Orbit-compatible chain; addresses of Lighter, Morpho,
-///         the Uniswap V4 PoolManager, and the messenger are read from
-///         environment variables so the same script works on Robinhood Chain
-///         mainnet, Robinhood Chain Sepolia, and a Caldera devnet.
+/// @notice One-shot deployment for the StockChain awareness layer. Same
+///         script works on:
+///           - Arbitrum Sepolia         (default, real Uniswap V4 / Morpho)
+///           - Robinhood Chain Sepolia  (when the RH devnet exposes v4)
+///           - Robinhood Chain mainnet  (production target)
+///           - Any Arbitrum Orbit chain (Caldera devnet, custom L3)
+///
+///         Every external address is read from the environment. Missing
+///         addresses default to `address(0)` so partial deployments (e.g.
+///         "token + points only, no perp") still succeed.
 ///
 /// Usage:
 ///   forge script script/DeployCore.s.sol \
-///     --rpc-url $ROBINHOOD_CHAIN_RPC \
+///     --rpc-url $ARB_SEPOLIA_RPC \
+///     --private-key $DEPLOYER_PK \
 ///     --broadcast --verify
+///
+///     ARB_SEPOLIA_RPC=https://sepolia-rollup.arbitrum.io/rpc
+///     STONK_ADMIN=<safe multisig or EOA>
+///     UNISWAP_V4_POOL_MANAGER=0xFB3e0C6F74eB1a21CC1Da29aeC80D2Dfe6C9a317   # Arb Sepolia v4
+///     MORPHO_BLUE=0x0000000000000000000000000000000000000000              # not yet on Arb Sepolia; set when live
+///     LIGHTER=0x0000000000000000000000000000000000000000                  # not yet on Arb Sepolia
+///     CROSS_CHAIN_MESSENGER=0x0000000000000000000000000000000000000000    # bridge stubbed by admin keeper for now
+///     USDG=<mock ERC-20 on testnet | canonical USDG on mainnet>
+///     ENTRYPOINT_4337=0x0000000071727De22E5E9d8BAf0edAc6f37da032           # canonical v0.7 EntryPoint
 contract DeployCore is Script {
-    function run() external {
+    struct Addresses {
+        address stonkToken;
+        address points;
+        address hook;
+        address bridge;
+        address session;
+        address margin;
+        address adapter;
+        address paymaster;
+    }
+
+    function run() external returns (Addresses memory out) {
         address admin = vm.envAddress("STONK_ADMIN");
-        address poolManager = vm.envAddress("UNISWAP_V4_POOL_MANAGER");
-        address lighter = vm.envAddress("LIGHTER");
-        address morpho = vm.envAddress("MORPHO_BLUE");
-        address messenger = vm.envAddress("CROSS_CHAIN_MESSENGER");
+        address poolManager = _envOr("UNISWAP_V4_POOL_MANAGER", address(0));
+        address lighter = _envOr("LIGHTER", address(0));
+        address morpho = _envOr("MORPHO_BLUE", address(0));
+        address messenger = _envOr("CROSS_CHAIN_MESSENGER", address(0));
+        address usdg = _envOr("USDG", address(0));
+        address entryPoint = _envOr("ENTRYPOINT_4337", 0x0000000071727De22E5E9d8BAf0edAc6f37da032);
 
         vm.startBroadcast();
 
-        MultiplierAwareHook hook = new MultiplierAwareHook(poolManager);
-        console2.log("MultiplierAwareHook", address(hook));
+        StonkToken token = new StonkToken(admin);
+        out.stonkToken = address(token);
+        console2.log("StonkToken            ", address(token));
+
+        StonkPoints points = new StonkPoints(admin);
+        out.points = address(points);
+        console2.log("StonkPoints           ", address(points));
 
         SessionKeyRouter session = new SessionKeyRouter();
-        console2.log("SessionKeyRouter", address(session));
-
-        PortfolioMarginRouter margin = new PortfolioMarginRouter(ILighter(lighter), IMorphoBlue(morpho));
-        console2.log("PortfolioMarginRouter", address(margin));
+        out.session = address(session);
+        console2.log("SessionKeyRouter      ", address(session));
 
         MultiplierBridge bridge = new MultiplierBridge(admin, IL2ToL3Messenger(messenger));
-        console2.log("MultiplierBridge", address(bridge));
+        out.bridge = address(bridge);
+        console2.log("MultiplierBridge      ", address(bridge));
 
-        // Oracles are per-market — they get deployed alongside each Morpho
-        // market registration, not once globally. Emit the deployment
-        // command for the operator to run per stock.
+        if (poolManager != address(0)) {
+            MultiplierAwareHook hook = new MultiplierAwareHook(poolManager);
+            out.hook = address(hook);
+            console2.log("MultiplierAwareHook   ", address(hook));
+        } else {
+            console2.log("SKIP MultiplierAwareHook (UNISWAP_V4_POOL_MANAGER unset)");
+        }
+
+        if (lighter != address(0) && morpho != address(0)) {
+            PortfolioMarginRouter margin = new PortfolioMarginRouter(ILighter(lighter), IMorphoBlue(morpho));
+            out.margin = address(margin);
+            console2.log("PortfolioMarginRouter ", address(margin));
+        } else {
+            console2.log("SKIP PortfolioMarginRouter (LIGHTER or MORPHO_BLUE unset)");
+        }
+
+        if (lighter != address(0) && usdg != address(0)) {
+            LighterAdapter adapter = new LighterAdapter(lighter, usdg, admin);
+            out.adapter = address(adapter);
+            console2.log("LighterAdapter        ", address(adapter));
+        } else {
+            console2.log("SKIP LighterAdapter (LIGHTER or USDG unset)");
+        }
+
+        if (usdg != address(0)) {
+            UsdgPaymaster pm = new UsdgPaymaster(entryPoint, usdg, admin, 200);
+            out.paymaster = address(pm);
+            console2.log("UsdgPaymaster         ", address(pm));
+        } else {
+            console2.log("SKIP UsdgPaymaster (USDG unset)");
+        }
+
         console2.log("---");
-        console2.log("Next: deploy per-stock MultiplierAwareOracle instances.");
-        console2.log("Set _stockToken, _feedId, _priceSource, and dsAlreadyScaled=true");
-        console2.log("when using Chainlink Data Streams on Robinhood Chain.");
+        console2.log("Next: deploy per-stock MultiplierAwareOracle instances alongside each Morpho market.");
+        console2.log("      Set stockToken / feedId / priceSource per stock, keep dsAlreadyScaled=true.");
 
         vm.stopBroadcast();
+    }
+
+    function _envOr(string memory key, address fallback_) internal view returns (address) {
+        try vm.envAddress(key) returns (address v) {
+            return v;
+        } catch {
+            return fallback_;
+        }
     }
 }
